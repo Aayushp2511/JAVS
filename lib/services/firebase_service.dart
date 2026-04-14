@@ -81,14 +81,20 @@ class FirebaseService {
       if (encryptedBytes != null) 'contentBytes': Blob(encryptedBytes),
     };
 
-    await chatRef.set({
-      'participants': parts,
-      'lastMessage': messageType == 'text' ? ciphertext : '[${messageType.toUpperCase()}]',
-      'lastMessageType': messageType,
-      'lastSenderId': user.uid,
-      'timestamp': FieldValue.serverTimestamp(),
-      'updatedAt': FieldValue.serverTimestamp(),
-    }, SetOptions(merge: true));
+    try {
+      await chatRef.set({
+        'participants': parts,
+        'lastMessage': messageType == 'text' ? ciphertext : '[${messageType.toUpperCase()}]',
+        'lastMessageType': messageType,
+        'lastSenderId': user.uid,
+        'timestamp': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } catch (e) {
+      // Some rule sets allow message docs but block parent chat metadata updates.
+      // Keep delivery working by continuing to write the message payload.
+      print('Chat metadata update skipped: $e');
+    }
 
     await chatRef.collection('messages').add(messagePayload);
   }
@@ -186,14 +192,19 @@ class FirebaseService {
       final chatId = uids.join("_");
       final chatRef = _db.collection('chats').doc(chatId);
 
-      await chatRef.set({
-        'participants': uids,
-        'lastMessage': messageType == 'text' ? ciphertext : '[${messageType.toUpperCase()}]',
-        'lastMessageType': messageType,
-        'lastSenderId': user.uid,
-        'timestamp': FieldValue.serverTimestamp(),
-        'updatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+      try {
+        await chatRef.set({
+          'participants': uids,
+          'lastMessage': messageType == 'text' ? ciphertext : '[${messageType.toUpperCase()}]',
+          'lastMessageType': messageType,
+          'lastSenderId': user.uid,
+          'timestamp': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      } catch (e) {
+        // Keep message delivery working if parent chat writes are denied by rules.
+        print('Chat metadata upsert skipped: $e');
+      }
 
       // Send the encrypted message with the encryption key
       await chatRef.collection('messages').add({

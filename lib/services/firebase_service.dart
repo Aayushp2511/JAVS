@@ -119,15 +119,41 @@ class FirebaseService {
   /// Look up user by email
   Future<JAVSUser?> getUserByEmail(String email) async {
     try {
+      final normalized = email.trim().toLowerCase();
+
       final snapshot = await _db
           .collection('users')
-          .where('email', isEqualTo: email.toLowerCase())
+          .where('email', isEqualTo: normalized)
           .limit(1)
           .get();
       
       if (snapshot.docs.isNotEmpty) {
         return JAVSUser.fromFirestore(snapshot.docs.first);
       }
+
+      // Fallback for old records where email may not be normalized.
+      final raw = email.trim();
+      if (raw != normalized) {
+        final rawSnapshot = await _db
+            .collection('users')
+            .where('email', isEqualTo: raw)
+            .limit(1)
+            .get();
+        if (rawSnapshot.docs.isNotEmpty) {
+          return JAVSUser.fromFirestore(rawSnapshot.docs.first);
+        }
+      }
+
+      // Final fallback: client-side normalization for legacy datasets.
+      final broadSnapshot = await _db.collection('users').limit(300).get();
+      for (final doc in broadSnapshot.docs) {
+        final data = doc.data();
+        final docEmail = (data['email'] as String? ?? '').trim().toLowerCase();
+        if (docEmail == normalized) {
+          return JAVSUser.fromFirestore(doc);
+        }
+      }
+
       return null;
     } catch (e) {
       print('Error looking up user by email: $e');

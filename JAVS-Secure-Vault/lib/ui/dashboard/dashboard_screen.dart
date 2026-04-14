@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'dart:typed_data';
 import 'dart:io';
 import 'dart:convert';
@@ -14,8 +15,21 @@ import '../../core/mtd/react_module.dart';
 import '../../services/firebase_service.dart';
 import '../theme/cyber_theme.dart';
 import '../chat/chat_screen.dart';
-
 import '../../widgets/graph_visualizer.dart';
+
+enum _IdmcFlow { plainText, fileImages }
+
+class _PendingDeliveryFile {
+  final PlatformFile file;
+  final String content;
+  final String type;
+
+  const _PendingDeliveryFile({
+    required this.file,
+    required this.content,
+    required this.type,
+  });
+}
 
 class DashboardScreen extends ConsumerStatefulWidget {
   const DashboardScreen({super.key});
@@ -30,16 +44,17 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   final _sessionController = TextEditingController(text: "JAVS-SIGMA-9");
   final _emailController = TextEditingController();
   final _messageController = TextEditingController();
-  final _keyController = TextEditingController();
   String _output = "";
   bool _isProcessing = false;
   bool _isDecryptMode = false;
   bool _isSendingMessage = false;
+  _IdmcFlow _idmcFlow = _IdmcFlow.plainText;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   int _unreadCount = 0;
   StreamSubscription? _chatSubscription;
   PlatformFile? _selectedFile;
   String? _fileContent;
+  final List<_PendingDeliveryFile> _vaultPendingFiles = [];
 
   void _runIDMC() async {
     String inputText = _textController.text;
@@ -127,19 +142,52 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     );
   }
 
-  void _sendEncryptedMessage() async {
+  String _generateAutoKey() {
+    final random = Random.secure().nextInt(900000) + 100000;
+    return 'AUTO-${DateTime.now().millisecondsSinceEpoch}-$random';
+  }
+
+  String _detectFileType(String extension) {
+    return 'file';
+  }
+
+  Future<void> _pickVaultFiles() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf', 'doc', 'docx', 'txt', 'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'],
+      allowMultiple: true,
+      withData: false,
+    );
+
+    if (result == null || result.files.isEmpty) return;
+
+    for (final file in result.files) {
+      if (file.path == null) continue;
+      final bytes = await File(file.path!).readAsBytes();
+      final ext = (file.extension ?? '').toLowerCase();
+      final content = ext == 'txt' ? String.fromCharCodes(bytes) : base64Encode(bytes);
+      _vaultPendingFiles.add(
+        _PendingDeliveryFile(
+          file: file,
+          content: content,
+          type: _detectFileType(ext),
+        ),
+      );
+    }
+    setState(() {});
+  }
+
+  Future<void> _sendFastDeliverItems() async {
     final email = _emailController.text.trim();
     final message = _messageController.text.trim();
-    final key = _keyController.text.trim();
 
-    if (email.isEmpty || message.isEmpty || key.isEmpty) {
+    if (email.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Please fill in all fields: email, message, and encryption key")),
+        const SnackBar(content: Text("Please add receiver email")),
       );
       return;
     }
 
-    // Basic email validation
     if (!RegExp(r'^[^@]+@[^@]+\.[^@]+').hasMatch(email)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Please enter a valid email address")),
@@ -147,36 +195,58 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
       return;
     }
 
+    if (message.isEmpty && _vaultPendingFiles.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Add text or at least one file to send")),
+      );
+      return;
+    }
+
     setState(() => _isSendingMessage = true);
 
     try {
-      // Encrypt the message using the provided key
-      final seed = IGMHSynchronizer.generate512BitSeed(key);
-      final encryptedMessage = IDMCEngine.encryptText(message, seed);
+      var sentItems = 0;
+      if (message.isNotEmpty) {
+        final textKey = _generateAutoKey();
+        final textSeed = IGMHSynchronizer.generate512BitSeed(textKey);
+        final encryptedText = IDMCEngine.encryptText(message, textSeed);
+        final sent = await ref.read(firebaseServiceProvider).sendEncryptedMessageToEmail(
+              email,
+              encryptedText,
+              textKey,
+              messageType: 'text',
+            );
+        if (sent) sentItems++;
+      }
 
-      // Send the encrypted message to the user by email
-      final success = await ref.read(firebaseServiceProvider).sendEncryptedMessageToEmail(
-        email,
-        encryptedMessage,
-        key,
-      );
+      for (final pending in _vaultPendingFiles) {
+        final autoKey = _generateAutoKey();
+        final seed = IGMHSynchronizer.generate512BitSeed(autoKey);
+        final encryptedFile = IDMCEngine.encryptText(pending.content, seed);
+        final sent = await ref.read(firebaseServiceProvider).sendEncryptedMessageToEmail(
+              email,
+              encryptedFile,
+              autoKey,
+              messageType: pending.type,
+            );
+        if (sent) sentItems++;
+      }
 
-      if (success) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Encrypted message sent successfully!")),
-        );
-        // Clear the input fields
-        _emailController.clear();
-        _messageController.clear();
-        _keyController.clear();
-      } else {
+      if (sentItems == 0) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Failed to send message. User may not exist.")),
         );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Sent $sentItems encrypted item(s) successfully")),
+        );
+        _messageController.clear();
+        _vaultPendingFiles.clear();
+        setState(() {});
       }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Error sending message: $e")),
+        SnackBar(content: Text("Error sending item(s): $e")),
       );
     } finally {
       setState(() => _isSendingMessage = false);
@@ -417,7 +487,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.security), label: "IDMC"),
           BottomNavigationBarItem(icon: Icon(Icons.storage), label: "Vault"),
-          BottomNavigationBarItem(icon: Icon(Icons.people), label: "Agents"),
+          BottomNavigationBarItem(icon: Icon(Icons.people), label: "Messages"),
         ],
       ),
       body: Container(
@@ -434,7 +504,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
             children: [
               _buildCryptoTab(mtd),
               _buildVaultTab(),
-              _buildAgentsTab(),
+              _buildMessagesTab(),
             ],
           ),
         ),
@@ -617,7 +687,33 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _buildHeader("IDMC.ENGINE"),
-          const SizedBox(height: 24),
+          const SizedBox(height: 20),
+          Row(
+            children: [
+              Expanded(
+                child: _flowButton(
+                  label: "Plain Text",
+                  icon: Icons.text_fields,
+                  selected: _idmcFlow == _IdmcFlow.plainText,
+                  onTap: () => setState(() {
+                    _idmcFlow = _IdmcFlow.plainText;
+                    _selectedFile = null;
+                    _fileContent = null;
+                  }),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _flowButton(
+                  label: "File / Images",
+                  icon: Icons.file_copy_outlined,
+                  selected: _idmcFlow == _IdmcFlow.fileImages,
+                  onTap: () => setState(() => _idmcFlow = _IdmcFlow.fileImages),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
           _buildMTDStatus(mtd),
           const SizedBox(height: 24),
           Expanded(
@@ -650,6 +746,46 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     );
   }
 
+  Widget _flowButton({
+    required String label,
+    required IconData icon,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeInOut,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(16),
+        color: selected ? CyberTheme.primaryNeon.withOpacity(0.18) : CyberTheme.surface,
+        border: Border.all(
+          color: selected ? CyberTheme.primaryNeon : Colors.white12,
+          width: 1.2,
+        ),
+      ),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 18),
+          child: Column(
+            children: [
+              Icon(icon, color: selected ? CyberTheme.primaryNeon : Colors.white70),
+              const SizedBox(height: 8),
+              Text(
+                label,
+                style: TextStyle(
+                  color: selected ? CyberTheme.primaryNeon : Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _modeToggle(String label, bool active, VoidCallback onTap) {
     return Expanded(
       child: InkWell(
@@ -678,103 +814,167 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
 
   Widget _buildVaultTab() {
     final vaultAsync = ref.watch(vaultStreamProvider);
+    final historyAsync = ref.watch(deliveryHistoryStreamProvider);
     return Padding(
-      padding: const EdgeInsets.all(24.0),
+      padding: const EdgeInsets.all(20),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _buildHeader("CLOUD.VAULT"),
-          const SizedBox(height: 24),
-          // Send Encrypted Message Section
+          _buildHeader("VAULT"),
+          const SizedBox(height: 16),
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
               color: CyberTheme.surface,
               borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: CyberTheme.primaryNeon.withOpacity(0.3)),
+              border: Border.all(color: CyberTheme.primaryNeon.withOpacity(0.25)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  "SEND ENCRYPTED MESSAGE",
-                  style: TextStyle(
-                    color: CyberTheme.primaryNeon,
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.5,
-                  ),
+                const Text("FAST DELIVER", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+                const SizedBox(height: 6),
+                const Text(
+                  "Send encrypted text and files. Keys are generated internally.",
+                  style: TextStyle(color: Colors.grey, fontSize: 12),
                 ),
                 const SizedBox(height: 16),
                 TextField(
                   controller: _emailController,
                   decoration: const InputDecoration(
-                    labelText: "RECIPIENT EMAIL",
-                    hintText: "Enter recipient's email address",
+                    labelText: "Receiver Email",
+                    hintText: "name@example.com",
                     prefixIcon: Icon(Icons.email, color: CyberTheme.primaryNeon),
                   ),
                   keyboardType: TextInputType.emailAddress,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
                 ),
                 const SizedBox(height: 12),
                 TextField(
                   controller: _messageController,
                   maxLines: 3,
                   decoration: const InputDecoration(
-                    labelText: "PLAINTEXT MESSAGE",
-                    hintText: "Enter message to encrypt and send",
+                    labelText: "Text",
+                    hintText: "Optional message",
                     prefixIcon: Icon(Icons.message, color: CyberTheme.primaryNeon),
                   ),
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
                 ),
                 const SizedBox(height: 12),
-                TextField(
-                  controller: _keyController,
-                  decoration: const InputDecoration(
-                    labelText: "ENCRYPTION KEY",
-                    hintText: "Enter encryption key",
-                    prefixIcon: Icon(Icons.key, color: CyberTheme.primaryNeon),
-                  ),
-                  obscureText: true,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
+                OutlinedButton.icon(
+                  onPressed: _pickVaultFiles,
+                  icon: const Icon(Icons.attach_file),
+                  label: const Text("Add File / Images"),
                 ),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: _isSendingMessage ? null : _sendEncryptedMessage,
+                if (_vaultPendingFiles.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  ..._vaultPendingFiles.map(
+                    (pending) => Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: CyberTheme.background.withOpacity(0.5),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.white12),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.insert_drive_file, size: 16, color: CyberTheme.primaryNeon),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              pending.file.name,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 14),
+                ElevatedButton.icon(
+                  onPressed: _isSendingMessage ? null : _sendFastDeliverItems,
+                  icon: _isSendingMessage
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.send_rounded),
+                  label: Text(_isSendingMessage ? "Sending..." : "Send Items"),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: CyberTheme.primaryNeon,
                     minimumSize: const Size(double.infinity, 48),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  child: _isSendingMessage
-                      ? const SizedBox(
-                          height: 20,
-                          width: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor: AlwaysStoppedAnimation<Color>(Colors.black),
-                          ),
-                        )
-                      : const Text(
-                          "SEND ENCRYPTED MESSAGE",
-                          style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
-                        ),
                 ),
               ],
             ),
           ),
-          const SizedBox(height: 24),
-          // Existing vault items section
+          const SizedBox(height: 16),
           Expanded(
-            child: vaultAsync.when(
-              data: (items) => items.isEmpty 
-                ? const Center(child: Text("Vault Empty. Sync nodes to start."))
-                : ListView.builder(
-                    itemCount: items.length,
-                    itemBuilder: (context, index) => _buildVaultItem(items[index]),
+            child: SingleChildScrollView(
+              child: Column(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: CyberTheme.surface,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: historyAsync.when(
+                      data: (history) {
+                        final sent = history.where((e) => e.isSentByCurrentUser).toList();
+                        final received = history.where((e) => !e.isSentByCurrentUser).toList();
+                        return Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(child: _buildHistoryColumn(title: "Sent", items: sent)),
+                            const SizedBox(width: 12),
+                            Expanded(child: _buildHistoryColumn(title: "Received", items: received)),
+                          ],
+                        );
+                      },
+                      loading: () => const Padding(
+                        padding: EdgeInsets.all(20),
+                        child: Center(child: CircularProgressIndicator()),
+                      ),
+                      error: (e, r) => Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Text("Failed loading history: $e"),
+                      ),
+                    ),
                   ),
-              loading: () => const Center(child: CircularProgressIndicator()),
-              error: (e, r) => Center(child: Text("Sync Error: $e")),
+                  const SizedBox(height: 14),
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: CyberTheme.surface,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: vaultAsync.when(
+                      data: (items) => items.isEmpty
+                          ? const Padding(
+                              padding: EdgeInsets.all(20),
+                              child: Center(child: Text("Vault Empty. Sync nodes to start.")),
+                            )
+                          : ListView.builder(
+                              shrinkWrap: true,
+                              physics: const NeverScrollableScrollPhysics(),
+                              itemCount: items.length,
+                              itemBuilder: (context, index) => _buildVaultItem(items[index]),
+                            ),
+                      loading: () => const Padding(
+                        padding: EdgeInsets.all(20),
+                        child: Center(child: CircularProgressIndicator()),
+                      ),
+                      error: (e, r) => Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Text("Sync Error: $e"),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
@@ -782,7 +982,74 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     );
   }
 
-  Widget _buildAgentsTab() {
+  String _formatTimestamp(DateTime timestamp) {
+    if (timestamp.millisecondsSinceEpoch == 0) return '--';
+    final hh = timestamp.hour.toString().padLeft(2, '0');
+    final mm = timestamp.minute.toString().padLeft(2, '0');
+    final dd = timestamp.day.toString().padLeft(2, '0');
+    final mo = timestamp.month.toString().padLeft(2, '0');
+    return '$dd/$mo ${hh}:$mm';
+  }
+
+  Widget _buildHistoryColumn({
+    required String title,
+    required List<DeliveryHistoryItem> items,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w700,
+            color: CyberTheme.primaryNeon,
+          ),
+        ),
+        const SizedBox(height: 10),
+        if (items.isEmpty)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: CyberTheme.background.withOpacity(0.45),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Text("No entries", style: TextStyle(fontSize: 11, color: Colors.grey)),
+          ),
+        if (items.isNotEmpty)
+          ...items.take(10).map(
+                (item) => Container(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: CyberTheme.background.withOpacity(0.45),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: Colors.white10),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(item.email, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      const SizedBox(height: 4),
+                      Text(
+                        "Type: ${item.type}",
+                        style: const TextStyle(fontSize: 11, color: Colors.grey),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        _formatTimestamp(item.timestamp),
+                        style: const TextStyle(fontSize: 10, color: Colors.grey),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+      ],
+    );
+  }
+
+  Widget _buildMessagesTab() {
     final agentsAsync = ref.watch(contactStreamProvider);
     return Padding(
       padding: const EdgeInsets.all(24.0),
@@ -1137,49 +1404,65 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
 
   Widget _buildMTDStatus(REACTState mtd) {
     return Container(
-      height: 110,
       width: double.infinity,
       decoration: BoxDecoration(
         color: CyberTheme.surface,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: CyberTheme.primaryNeon.withOpacity(0.3), width: 1.5),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: CyberTheme.primaryNeon.withOpacity(0.3)),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Row(
+        padding: const EdgeInsets.all(14),
+        child: Column(
           children: [
-            Stack(
-              alignment: Alignment.center,
+            Row(
               children: [
-                SizedBox(
-                  width: 60,
-                  height: 60,
-                  child: CircularProgressIndicator(
-                    value: mtd.currentEntropy / 8.0,
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: (mtd.isAuditPassed ? CyberTheme.primaryNeon : CyberTheme.errorNeon)
+                        .withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Icon(
+                    mtd.isAuditPassed ? Icons.verified : Icons.error_outline,
                     color: mtd.isAuditPassed ? CyberTheme.primaryNeon : CyberTheme.errorNeon,
-                    strokeWidth: 3,
                   ),
                 ),
-                Text("${mtd.currentEntropy.toStringAsFixed(1)}", 
-                  style: TextStyle(fontWeight: FontWeight.bold, color: mtd.isAuditPassed ? Colors.white : CyberTheme.errorNeon)),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        "MTD Security Audit",
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        mtd.systemStatus.toUpperCase(),
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: mtd.isAuditPassed ? CyberTheme.primaryNeon : CyberTheme.errorNeon,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 1,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Text(
+                  mtd.currentEntropy.toStringAsFixed(1),
+                  style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+                ),
               ],
             ),
-            const SizedBox(width: 20),
-            Expanded(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text("MTD SECURITY AUDIT", style: TextStyle(fontSize: 10, color: CyberTheme.primaryNeon, letterSpacing: 1.5)),
-                  const SizedBox(height: 4),
-                  Text(mtd.systemStatus.toUpperCase(), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 2),
-                  Text(
-                    "Rotates keys automatically if entropy < 7.5",
-                    style: TextStyle(fontSize: 9, color: Colors.white.withOpacity(0.4)),
-                  ),
-                ],
-              ),
+            const SizedBox(height: 10),
+            Text(
+              "Entropy is monitored continuously. Keys rotate automatically if entropy drops below 7.5.",
+              style: TextStyle(fontSize: 12, color: Colors.white.withOpacity(0.7), height: 1.3),
             ),
           ],
         ),
@@ -1196,77 +1479,74 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
           style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
         ),
         const SizedBox(height: 12),
-        // File attachment section
-        Container(
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: CyberTheme.surface,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: CyberTheme.primaryNeon.withOpacity(0.3)),
-          ),
-          child: Column(
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.attach_file, color: CyberTheme.primaryNeon, size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _selectedFile != null 
-                          ? 'Attached: ${_selectedFile!.name}'
-                          : 'Attach PDF, Document, or Image',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: _selectedFile != null 
-                            ? CyberTheme.primaryNeon 
-                            : Colors.grey,
+        if (_idmcFlow == _IdmcFlow.fileImages) ...[
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: CyberTheme.surface,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: CyberTheme.primaryNeon.withOpacity(0.3)),
+            ),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.attach_file, color: CyberTheme.primaryNeon, size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _selectedFile != null ? 'Attached: ${_selectedFile!.name}' : 'Attach PDF, Document, or Image',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: _selectedFile != null ? CyberTheme.primaryNeon : Colors.grey,
+                        ),
+                        overflow: TextOverflow.ellipsis,
                       ),
-                      overflow: TextOverflow.ellipsis,
                     ),
-                  ),
-                  IconButton(
-                    icon: Icon(
-                      _selectedFile != null ? Icons.check_circle : Icons.upload_file,
-                      color: CyberTheme.primaryNeon,
-                      size: 20,
-                    ),
-                    onPressed: _pickFile,
-                  ),
-                  if (_selectedFile != null)
                     IconButton(
-                      icon: const Icon(Icons.clear, color: Colors.red, size: 20),
-                      onPressed: () {
-                        setState(() {
-                          _selectedFile = null;
-                          _fileContent = null;
-                        });
-                      },
+                      icon: Icon(
+                        _selectedFile != null ? Icons.check_circle : Icons.upload_file,
+                        color: CyberTheme.primaryNeon,
+                        size: 20,
+                      ),
+                      onPressed: _pickFile,
                     ),
+                    if (_selectedFile != null)
+                      IconButton(
+                        icon: const Icon(Icons.clear, color: Colors.red, size: 20),
+                        onPressed: () {
+                          setState(() {
+                            _selectedFile = null;
+                            _fileContent = null;
+                          });
+                        },
+                      ),
+                  ],
+                ),
+                if (_selectedFile != null) ...[
+                  const SizedBox(height: 8),
+                  LinearProgressIndicator(
+                    value: 1.0,
+                    backgroundColor: Colors.grey[800],
+                    valueColor: const AlwaysStoppedAnimation<Color>(CyberTheme.primaryNeon),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Size: ${(_selectedFile!.size / 1024).toStringAsFixed(2)} KB',
+                    style: const TextStyle(fontSize: 10, color: Colors.grey),
+                  ),
                 ],
-              ),
-              if (_selectedFile != null) ...[
-                const SizedBox(height: 8),
-                LinearProgressIndicator(
-                  value: 1.0,
-                  backgroundColor: Colors.grey[800],
-                  valueColor: const AlwaysStoppedAnimation<Color>(CyberTheme.primaryNeon),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Size: ${(_selectedFile!.size / 1024).toStringAsFixed(2)} KB',
-                  style: const TextStyle(fontSize: 10, color: Colors.grey),
-                ),
               ],
-            ],
+            ),
           ),
-        ),
-        const SizedBox(height: 12),
+          const SizedBox(height: 12),
+        ],
         TextField(
           controller: _textController,
           maxLines: 4,
           decoration: InputDecoration(
             labelText: _isDecryptMode ? "CIPHERTEXT" : "PLAINTEXT",
-            hintText: _selectedFile != null 
+            hintText: _selectedFile != null
                 ? "Or enter text manually (file will be used)"
                 : "Enter payload or attach file...",
           ),

@@ -100,7 +100,12 @@ class FirebaseService {
   }
 
   /// Send encrypted message to user by email
-  Future<bool> sendEncryptedMessageToEmail(String email, String ciphertext, String encryptionKey) async {
+  Future<bool> sendEncryptedMessageToEmail(
+    String email,
+    String ciphertext,
+    String encryptionKey, {
+    String messageType = 'text',
+  }) async {
     try {
       final user = _auth.currentUser;
       if (user == null) return false;
@@ -120,8 +125,11 @@ class FirebaseService {
       await _db.collection('chats').doc(chatId).collection('messages').add({
         'senderId': user.uid,
         'recipientId': recipient.uid,
+        'senderEmail': user.email ?? '',
+        'recipientEmail': recipient.email,
         'content': ciphertext,
         'encryptionKey': encryptionKey,
+        'messageType': messageType,
         'timestamp': FieldValue.serverTimestamp(),
         'status': 'sent',
       });
@@ -199,6 +207,30 @@ class FirebaseService {
       return [];
     }
   }
+
+  /// Delivery history for Fast Deliver section
+  Stream<List<DeliveryHistoryItem>> deliveryHistoryStream() {
+    final user = _auth.currentUser;
+    if (user == null) return Stream.value([]);
+
+    return _db
+        .collectionGroup('messages')
+        .where('status', isEqualTo: 'sent')
+        .where(
+          Filter.or(
+            Filter('senderId', isEqualTo: user.uid),
+            Filter('recipientId', isEqualTo: user.uid),
+          ),
+        )
+        .snapshots()
+        .map((snapshot) {
+      final history = snapshot.docs
+          .map((doc) => DeliveryHistoryItem.fromFirestore(doc, user.uid))
+          .toList();
+      history.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+      return history;
+    });
+  }
 }
 
 class VaultItem {
@@ -254,6 +286,43 @@ class JAVSMessage {
   }
 }
 
+class DeliveryHistoryItem {
+  final String id;
+  final String email;
+  final String type;
+  final DateTime timestamp;
+  final bool isSentByCurrentUser;
+
+  DeliveryHistoryItem({
+    required this.id,
+    required this.email,
+    required this.type,
+    required this.timestamp,
+    required this.isSentByCurrentUser,
+  });
+
+  factory DeliveryHistoryItem.fromFirestore(
+    DocumentSnapshot doc,
+    String currentUserUid,
+  ) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    final senderId = data['senderId'] as String? ?? '';
+    final isSent = senderId == currentUserUid;
+    final fallbackTimestamp = DateTime.fromMillisecondsSinceEpoch(0);
+    final firestoreTimestamp = data['timestamp'] as Timestamp?;
+
+    return DeliveryHistoryItem(
+      id: doc.id,
+      email: isSent
+          ? (data['recipientEmail'] as String? ?? 'Unknown')
+          : (data['senderEmail'] as String? ?? 'Unknown'),
+      type: (data['messageType'] as String? ?? 'text').toLowerCase(),
+      timestamp: firestoreTimestamp?.toDate() ?? fallbackTimestamp,
+      isSentByCurrentUser: isSent,
+    );
+  }
+}
+
 final firebaseServiceProvider = Provider((ref) => FirebaseService());
 
 final vaultStreamProvider = StreamProvider<List<VaultItem>>((ref) {
@@ -266,4 +335,8 @@ final contactStreamProvider = StreamProvider<List<JAVSUser>>((ref) {
 
 final chatStreamProvider = StreamProvider.family<List<JAVSMessage>, String>((ref, otherUid) {
   return ref.watch(firebaseServiceProvider).chatStream(otherUid);
+});
+
+final deliveryHistoryStreamProvider = StreamProvider<List<DeliveryHistoryItem>>((ref) {
+  return ref.watch(firebaseServiceProvider).deliveryHistoryStream();
 });

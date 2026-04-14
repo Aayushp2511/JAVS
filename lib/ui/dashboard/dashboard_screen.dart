@@ -58,9 +58,31 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   Uint8List? _fileBytes;
   Uint8List? _lastCipherBytes;
   Uint8List? _vaultCipherBytes;
+  Uint8List? _lastDecryptedBytes;
   String _vaultPayloadType = 'text';
   String? _vaultSessionToken;
   final List<_PendingDeliveryFile> _vaultPendingFiles = [];
+
+  bool _looksLikeImage(Uint8List bytes) {
+    if (bytes.length < 4) return false;
+    final isPng =
+        bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47;
+    final isJpeg = bytes[0] == 0xFF && bytes[1] == 0xD8;
+    final isGif =
+        bytes[0] == 0x47 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x38;
+    final isBmp = bytes[0] == 0x42 && bytes[1] == 0x4D;
+    final isWebp =
+        bytes.length >= 12 &&
+        bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46 &&
+        bytes[8] == 0x57 &&
+        bytes[9] == 0x45 &&
+        bytes[10] == 0x42 &&
+        bytes[11] == 0x50;
+    return isPng || isJpeg || isGif || isBmp || isWebp;
+  }
 
   Future<void> _writeDecryptedBytes(Uint8List bytes, String suggestedName) async {
     final directory = await getApplicationDocumentsDirectory();
@@ -69,6 +91,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         : suggestedName;
     final savePath = '${directory.path}${Platform.pathSeparator}$safeName';
     await File(savePath).writeAsBytes(bytes, flush: true);
+    _lastDecryptedBytes = bytes;
     _output = 'Binary file successfully decrypted.\nSaved to: $savePath';
   }
 
@@ -122,6 +145,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
           _output = result;
           _lastCiphertext = result;
           _lastCipherBytes = encryptedBytes;
+          _lastDecryptedBytes = null;
           _isProcessing = false;
         });
       }
@@ -149,15 +173,18 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         );
         result = _output;
       } catch (e) {
+        _lastDecryptedBytes = null;
         result = "ERROR: CORRUPT_PAYLOAD_OR_WRONG_SEED";
       }
     } else if (_isDecryptMode) {
+      _lastDecryptedBytes = null;
       result = IDMCEngine.decryptText(inputText, seed);
     } else {
       result = IDMCEngine.encryptText(inputText, seed);
       ref.read(reactProvider.notifier).audit(Uint8List.fromList(result.codeUnits));
       _lastCiphertext = result;
       _lastCipherBytes = null;
+      _lastDecryptedBytes = null;
     }
     
     setState(() {
@@ -1678,6 +1705,21 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
             ),
             const Divider(),
             SelectableText(_output, style: const TextStyle(fontFamily: 'monospace', fontSize: 14)),
+            if (_isDecryptMode && _lastDecryptedBytes != null && _looksLikeImage(_lastDecryptedBytes!)) ...[
+              const SizedBox(height: 12),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.memory(
+                  _lastDecryptedBytes!,
+                  fit: BoxFit.contain,
+                  height: 220,
+                  errorBuilder: (_, __, ___) => const Text(
+                    'Image reconstructed but preview failed.',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),

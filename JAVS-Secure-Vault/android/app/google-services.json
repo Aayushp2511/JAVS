@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "654814361692",
+    "project_id": "javs--vault-9a465",
+    "storage_bucket": "javs--vault-9a465.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:654814361692:android:ee78a0da891563805b4e99",
+        "android_client_info": {
+          "package_name": "com.javs.secure_messenger"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDOwqWul1mk3jhCIS0vAg-J6_NmT77HNhk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -75,6 +75,27 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
+  Future<void> _ensureUserDirectoryRecord(User user, {String? preferredDisplayName}) async {
+    final userRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
+    final existingDoc = await userRef.get();
+    final existingData = existingDoc.data() ?? <String, dynamic>{};
+    final fallbackName =
+        (preferredDisplayName != null && preferredDisplayName.trim().isNotEmpty)
+            ? preferredDisplayName.trim()
+            : (existingData['displayName'] as String?) ??
+                user.displayName ??
+                user.email?.split('@').first ??
+                'Agent_${user.uid.substring(0, 4)}';
+
+    await userRef.set({
+      'displayName': fallbackName,
+      'email': (user.email ?? _emailController.text).trim().toLowerCase(),
+      'status': 'Online',
+      'lastUpdate': FieldValue.serverTimestamp(),
+      if (!existingDoc.exists) 'createdAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
   Future<void> _submit() async {
     if (_emailController.text.isEmpty || _passwordController.text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -86,10 +107,13 @@ class _AuthScreenState extends State<AuthScreen> {
     setState(() => _isLoading = true);
     try {
       if (_isLogin) {
-        await FirebaseAuth.instance.signInWithEmailAndPassword(
+        final cred = await FirebaseAuth.instance.signInWithEmailAndPassword(
           email: _emailController.text.trim(),
           password: _passwordController.text.trim(),
         );
+        if (cred.user != null) {
+          await _ensureUserDirectoryRecord(cred.user!);
+        }
         await _saveCredentials();
       } else {
         if (_nameController.text.isEmpty) {
@@ -102,14 +126,11 @@ class _AuthScreenState extends State<AuthScreen> {
           email: _emailController.text.trim(),
           password: _passwordController.text.trim(),
         );
-        
-        await FirebaseFirestore.instance.collection('users').doc(cred.user!.uid).set({
-          'displayName': _nameController.text.trim(),
-          'email': _emailController.text.trim().toLowerCase(),
-          'status': 'Online',
-          'lastUpdate': FieldValue.serverTimestamp(),
-          'createdAt': FieldValue.serverTimestamp(),
-        });
+
+        await _ensureUserDirectoryRecord(
+          cred.user!,
+          preferredDisplayName: _nameController.text,
+        );
         
         await _saveCredentials();
       }

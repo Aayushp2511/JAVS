@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:path_provider/path_provider.dart';
 import '../../core/crypto/idmc_engine.dart';
 import '../../core/ml/igmh_synchronizer.dart';
 import '../../core/mtd/react_module.dart';
@@ -45,6 +46,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   final _emailController = TextEditingController();
   final _messageController = TextEditingController();
   String _output = "";
+  String _lastCiphertext = "";
   bool _isProcessing = false;
   bool _isDecryptMode = false;
   bool _isSendingMessage = false;
@@ -54,26 +56,53 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   StreamSubscription? _chatSubscription;
   PlatformFile? _selectedFile;
   Uint8List? _fileBytes;
+  Uint8List? _lastCipherBytes;
+  Uint8List? _vaultCipherBytes;
+  String _vaultPayloadType = 'text';
+  String? _vaultSessionToken;
   final List<_PendingDeliveryFile> _vaultPendingFiles = [];
+
+  Future<void> _writeDecryptedBytes(Uint8List bytes, String suggestedName) async {
+    final directory = await getApplicationDocumentsDirectory();
+    final safeName = suggestedName.trim().isEmpty
+        ? 'reconstructed_${DateTime.now().millisecondsSinceEpoch}.bin'
+        : suggestedName;
+    final savePath = '${directory.path}${Platform.pathSeparator}$safeName';
+    await File(savePath).writeAsBytes(bytes, flush: true);
+    _output = 'Binary file successfully decrypted.\nSaved to: $savePath';
+  }
 
   void _runIDMC() async {
     setState(() => _isProcessing = true);
     await Future.delayed(const Duration(milliseconds: 800));
 
-    final seed = IGMHSynchronizer.generate512BitSeed(_sessionController.text);
+    final sessionToken = (_vaultSessionToken?.trim().isNotEmpty ?? false)
+        ? _vaultSessionToken!.trim()
+        : _sessionController.text.trim();
+    final seed = IGMHSynchronizer.generate512BitSeed(sessionToken);
+    final outputCiphertext = _lastCiphertext.trim();
+
+    final forceBinaryDecrypt = _isDecryptMode &&
+        (_selectedFile != null && _fileBytes != null || _vaultPayloadType == 'file');
 
     // If file is selected, use file bytes instead of text input
     if (_selectedFile != null && _fileBytes != null) {
       if (_isDecryptMode) {
-        String ciphertext = String.fromCharCodes(_fileBytes!).trim();
+        String ciphertext = outputCiphertext.isNotEmpty
+            ? outputCiphertext
+            : utf8.decode(_fileBytes!, allowMalformed: true).trim();
         ciphertext = ciphertext.replaceAll('\n', '').replaceAll('\r', '').replaceAll(' ', '');
         try {
           final encryptedBytes = base64Decode(ciphertext);
           final decryptedBytes = IDMCEngine.processBytes(encryptedBytes, seed, decrypt: true);
-          
-          final savePath = '${_selectedFile!.path}_decrypted';
-          await File(savePath).writeAsBytes(decryptedBytes);
-          
+
+          final saveName = _selectedFile?.name.isNotEmpty == true
+              ? '${_selectedFile!.name}_decrypted'
+              : 'reconstructed_${DateTime.now().millisecondsSinceEpoch}.bin';
+          final directory = await getApplicationDocumentsDirectory();
+          final savePath = '${directory.path}${Platform.pathSeparator}$saveName';
+          await File(savePath).writeAsBytes(decryptedBytes, flush: true);
+
           setState(() {
             _output = "Binary file successfully decrypted.\nSaved to: $savePath";
             _isProcessing = false;
@@ -91,6 +120,8 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         
         setState(() {
           _output = result;
+          _lastCiphertext = result;
+          _lastCipherBytes = encryptedBytes;
           _isProcessing = false;
         });
       }
@@ -98,17 +129,35 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     }
 
     String inputText = _textController.text;
+    if (_isDecryptMode && inputText.trim().isEmpty && outputCiphertext.isNotEmpty) {
+      inputText = outputCiphertext;
+    }
     if (inputText.isEmpty) {
       setState(() => _isProcessing = false);
       return;
     }
 
     String result;
-    if (_isDecryptMode) {
+    if (forceBinaryDecrypt) {
+      try {
+        final encryptedBytes = _vaultCipherBytes ??
+            base64Decode(inputText.replaceAll('\n', '').replaceAll('\r', '').replaceAll(' ', ''));
+        final decryptedBytes = IDMCEngine.processBytes(encryptedBytes, seed, decrypt: true);
+        await _writeDecryptedBytes(
+          decryptedBytes,
+          _selectedFile?.name ?? _selectedFile?.path?.split(Platform.pathSeparator).last ?? 'vault_payload.bin',
+        );
+        result = _output;
+      } catch (e) {
+        result = "ERROR: CORRUPT_PAYLOAD_OR_WRONG_SEED";
+      }
+    } else if (_isDecryptMode) {
       result = IDMCEngine.decryptText(inputText, seed);
     } else {
       result = IDMCEngine.encryptText(inputText, seed);
       ref.read(reactProvider.notifier).audit(Uint8List.fromList(result.codeUnits));
+      _lastCiphertext = result;
+      _lastCipherBytes = null;
     }
     
     setState(() {
@@ -130,6 +179,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         
         setState(() {
           _selectedFile = file;
+          _vaultCipherBytes = null;
         });
 
         // Read file content based on type
@@ -157,10 +207,15 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   }
 
   void _saveToVault() async {
-    if (_output.isEmpty) return;
+    final ciphertext = _lastCiphertext.isNotEmpty ? _lastCiphertext : _output;
+    if (ciphertext.isEmpty) return;
     await ref.read(firebaseServiceProvider).saveToVault(
       "Secure_Payload_${DateTime.now().millisecondsSinceEpoch}.idmc",
-      _output
+      ciphertext,
+      payloadType: _selectedFile != null ? 'file' : 'text',
+      sessionToken: _sessionController.text.trim(),
+      attachmentName: _selectedFile?.name,
+      binaryPayload: _selectedFile != null ? _lastCipherBytes : null,
     );
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text("Cloud Node Synced Successfully")),
@@ -247,13 +302,14 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
         final autoKey = _generateAutoKey();
         final seed = IGMHSynchronizer.generate512BitSeed(autoKey);
         final encryptedBytes = IDMCEngine.processBytes(pending.rawBytes, seed, decrypt: false);
-        final encryptedFile = base64Encode(encryptedBytes);
         
         final sent = await ref.read(firebaseServiceProvider).sendEncryptedMessageToEmail(
               email,
-              encryptedFile,
+              '',
               autoKey,
               messageType: pending.type,
+              attachmentName: pending.file.name,
+              encryptedBytes: encryptedBytes,
             );
         if (sent) sentItems++;
       }
@@ -1632,12 +1688,24 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     return ListTile(
       leading: const Icon(Icons.all_inclusive, color: CyberTheme.primaryNeon),
       title: Text(item.title, style: const TextStyle(fontSize: 14)),
-      subtitle: Text("Size: ${item.content.length} bytes", style: const TextStyle(fontSize: 10)),
+      subtitle: Text(
+        "Size: ${item.binaryContent?.length ?? item.content.length} bytes",
+        style: const TextStyle(fontSize: 10),
+      ),
       trailing: const Icon(Icons.download, size: 18),
       onTap: () {
         setState(() {
           _isDecryptMode = true;
           _textController.text = item.content;
+          _lastCiphertext = item.content;
+          _vaultCipherBytes = item.binaryContent;
+          _vaultPayloadType = item.payloadType;
+          _vaultSessionToken = item.sessionToken;
+          if (item.sessionToken != null && item.sessionToken!.isNotEmpty) {
+            _sessionController.text = item.sessionToken!;
+          }
+          _selectedFile = null;
+          _fileBytes = null;
           _currentIndex = 0;
         });
       },

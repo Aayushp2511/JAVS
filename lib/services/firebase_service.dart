@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'dart:typed_data';
 
 class FirebaseService {
   final _db = FirebaseFirestore.instance;
@@ -29,7 +30,7 @@ class FirebaseService {
       if (snapshot.docs.isEmpty) return [];
       return snapshot.docs
           .map((doc) => JAVSUser.fromFirestore(doc))
-          .where((u) => u.uid != _auth.currentUser?.uid) // Don't show self
+          .where((u) => u.uid != _auth.currentUser?.uid && u.email.isNotEmpty) // Don't show self
           .toList();
     });
   }
@@ -55,6 +56,8 @@ class FirebaseService {
     String ciphertext, {
     String messageType = 'text',
     String? attachmentName,
+    String? encryptionKey,
+    Uint8List? encryptedBytes,
   }) async {
     final user = _auth.currentUser;
     if (user == null) return;
@@ -63,25 +66,52 @@ class FirebaseService {
     final parts = chatId.split('_');
     final recipientUid = parts.firstWhere((id) => id != user.uid, orElse: () => '');
 
-    await _db.collection('chats').doc(chatId).collection('messages').add({
+    final chatRef = _db.collection('chats').doc(chatId);
+    final messagePayload = {
       'senderId': user.uid,
       'recipientId': recipientUid,
+      'senderEmail': user.email ?? '',
       'content': ciphertext,
       'messageType': messageType,
-      'attachmentName': attachmentName,
       'timestamp': FieldValue.serverTimestamp(),
       'status': 'sent',
-    });
+      if (attachmentName != null) 'attachmentName': attachmentName,
+      if (encryptionKey != null && encryptionKey.isNotEmpty)
+        'encryptionKey': encryptionKey,
+      if (encryptedBytes != null) 'contentBytes': Blob(encryptedBytes),
+    };
+
+    await chatRef.set({
+      'participants': parts,
+      'lastMessage': messageType == 'text' ? ciphertext : '[${messageType.toUpperCase()}]',
+      'lastMessageType': messageType,
+      'lastSenderId': user.uid,
+      'timestamp': FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+
+    await chatRef.collection('messages').add(messagePayload);
   }
 
   /// Save Encrypted Payload to Vault
-  Future<void> saveToVault(String title, String ciphertext) async {
+  Future<void> saveToVault(
+    String title,
+    String ciphertext, {
+    String payloadType = 'text',
+    String? sessionToken,
+    String? attachmentName,
+    Uint8List? binaryPayload,
+  }) async {
     final user = _auth.currentUser;
     if (user == null) return;
 
     await _db.collection('vault').doc(user.uid).collection('items').add({
       'title': title,
       'content': ciphertext,
+      'payloadType': payloadType,
+      'sessionToken': sessionToken,
+      'attachmentName': attachmentName,
+      if (binaryPayload != null) 'binaryContent': Blob(binaryPayload),
       'timestamp': FieldValue.serverTimestamp(),
     });
   }
@@ -111,6 +141,8 @@ class FirebaseService {
     String ciphertext,
     String encryptionKey, {
     String messageType = 'text',
+    String? attachmentName,
+    Uint8List? encryptedBytes,
   }) async {
     try {
       final user = _auth.currentUser;
@@ -126,9 +158,19 @@ class FirebaseService {
       // Create chat room ID (sorted UIDs for consistency)
       final uids = [user.uid, recipient.uid]..sort();
       final chatId = uids.join("_");
+      final chatRef = _db.collection('chats').doc(chatId);
+
+      await chatRef.set({
+        'participants': uids,
+        'lastMessage': messageType == 'text' ? ciphertext : '[${messageType.toUpperCase()}]',
+        'lastMessageType': messageType,
+        'lastSenderId': user.uid,
+        'timestamp': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
 
       // Send the encrypted message with the encryption key
-      await _db.collection('chats').doc(chatId).collection('messages').add({
+      await chatRef.collection('messages').add({
         'senderId': user.uid,
         'recipientId': recipient.uid,
         'senderEmail': user.email ?? '',
@@ -136,6 +178,8 @@ class FirebaseService {
         'content': ciphertext,
         'encryptionKey': encryptionKey,
         'messageType': messageType,
+        if (attachmentName != null) 'attachmentName': attachmentName,
+        if (encryptedBytes != null) 'contentBytes': Blob(encryptedBytes),
         'timestamp': FieldValue.serverTimestamp(),
         'status': 'sent',
       });
@@ -179,6 +223,7 @@ class FirebaseService {
       
       for (var doc in snapshot.docs) {
         final chatId = doc.id;
+        final data = doc.data();
         final participants = chatId.split('_');
         
         if (participants.contains(user.uid)) {
@@ -190,8 +235,8 @@ class FirebaseService {
           chats.add({
             'chatId': chatId,
             'otherUid': otherUid,
-            'lastMessage': doc['lastMessage'] ?? '',
-            'timestamp': doc['timestamp'],
+            'lastMessage': data['lastMessage'] ?? '',
+            'timestamp': data['timestamp'],
           });
         }
       }
@@ -215,27 +260,54 @@ class FirebaseService {
   }
 
   /// Delivery history for Fast Deliver section
-  Stream<List<DeliveryHistoryItem>> deliveryHistoryStream() {
+  Stream<List<DeliveryHistoryItem>> deliveryHistoryStream() async* {
     final user = _auth.currentUser;
-    if (user == null) return Stream.value([]);
+    if (user == null) {
+      yield <DeliveryHistoryItem>[];
+      return;
+    }
 
-    return _db
-        .collectionGroup('messages')
-        .where('status', isEqualTo: 'sent')
-        .where(
-          Filter.or(
-            Filter('senderId', isEqualTo: user.uid),
-            Filter('recipientId', isEqualTo: user.uid),
+    try {
+      await for (final chatSnapshot in _db
+          .collection('chats')
+          .where('participants', arrayContains: user.uid)
+          .snapshots()) {
+        if (chatSnapshot.docs.isEmpty) {
+          yield <DeliveryHistoryItem>[];
+          continue;
+        }
+
+        final messageSnapshots = await Future.wait(
+          chatSnapshot.docs.map(
+            (chatDoc) => chatDoc.reference
+                .collection('messages')
+                .where('status', isEqualTo: 'sent')
+                .get(),
           ),
-        )
-        .snapshots()
-        .map((snapshot) {
-      final history = snapshot.docs
-          .map((doc) => DeliveryHistoryItem.fromFirestore(doc, user.uid))
-          .toList();
-      history.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-      return history;
-    });
+        );
+
+        final history = <DeliveryHistoryItem>[];
+        for (final messageSnapshot in messageSnapshots) {
+          for (final doc in messageSnapshot.docs) {
+            final data = doc.data();
+            final senderId = data['senderId'] as String? ?? '';
+            final recipientId = data['recipientId'] as String? ?? '';
+            if (senderId == user.uid || recipientId == user.uid) {
+              history.add(DeliveryHistoryItem.fromFirestore(doc, user.uid));
+            }
+          }
+        }
+
+        history.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+        yield history;
+      }
+    } on FirebaseException catch (e) {
+      if (e.code == 'permission-denied') {
+        yield <DeliveryHistoryItem>[];
+        return;
+      }
+      rethrow;
+    }
   }
 }
 
@@ -243,8 +315,20 @@ class VaultItem {
   final String id;
   final String title;
   final String content;
+  final String payloadType;
+  final String? sessionToken;
+  final String? attachmentName;
+  final Uint8List? binaryContent;
 
-  VaultItem({required this.id, required this.title, required this.content});
+  VaultItem({
+    required this.id,
+    required this.title,
+    required this.content,
+    required this.payloadType,
+    this.sessionToken,
+    this.attachmentName,
+    this.binaryContent,
+  });
 
   factory VaultItem.fromFirestore(DocumentSnapshot doc) {
     final Map<String, dynamic> data = doc.data() as Map<String, dynamic>? ?? {};
@@ -252,6 +336,10 @@ class VaultItem {
       id: doc.id,
       title: data['title'] ?? 'Untitled Node',
       content: data['content'] ?? '',
+      payloadType: (data['payloadType'] as String? ?? 'text').toLowerCase(),
+      sessionToken: data['sessionToken'] as String?,
+      attachmentName: data['attachmentName'] as String?,
+      binaryContent: (data['binaryContent'] as Blob?)?.bytes,
     );
   }
 }
@@ -277,16 +365,20 @@ class JAVSMessage {
   final String id;
   final String senderId;
   final String content;
+  final Uint8List? contentBytes;
   final String messageType;
   final String? attachmentName;
+  final String? encryptionKey;
   final String? senderName;
 
   JAVSMessage({
     required this.id,
     required this.senderId,
     required this.content,
+    this.contentBytes,
     this.messageType = 'text',
     this.attachmentName,
+    this.encryptionKey,
     this.senderName,
   });
 
@@ -296,8 +388,10 @@ class JAVSMessage {
       id: doc.id,
       senderId: data['senderId'] ?? '',
       content: data['content'] ?? '',
+      contentBytes: (data['contentBytes'] as Blob?)?.bytes,
       messageType: (data['messageType'] as String? ?? 'text').toLowerCase(),
       attachmentName: data['attachmentName'] as String?,
+      encryptionKey: data['encryptionKey'] as String?,
       senderName: data['senderName'] as String?,
     );
   }

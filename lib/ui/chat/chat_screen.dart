@@ -1,10 +1,13 @@
 import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:path_provider/path_provider.dart';
 import '../../services/firebase_service.dart';
 import '../../core/crypto/idmc_engine.dart';
 import '../../core/ml/igmh_synchronizer.dart';
@@ -30,6 +33,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   final TextEditingController _textController = TextEditingController();
   PlatformFile? _attachedFile;
 
+  String _generateMessageKey() {
+    final random = Random.secure().nextInt(900000) + 100000;
+    return 'MSG-${DateTime.now().millisecondsSinceEpoch}-$random';
+  }
+
   Future<void> _pickAttachment() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.any,
@@ -44,25 +52,52 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     });
   }
 
-  void _sendMessage() {
+  Future<void> _sendMessage() async {
     if (_attachedFile == null && _textController.text.trim().isEmpty) return;
 
-    final seed = IGMHSynchronizer.generate512BitSeed('default-session');
+    try {
+      if (_attachedFile != null && _attachedFile!.bytes != null) {
+        final key = _generateMessageKey();
+        final seed = IGMHSynchronizer.generate512BitSeed(key);
+        final encryptedBytes = IDMCEngine.processBytes(
+          Uint8List.fromList(_attachedFile!.bytes!),
+          seed,
+        );
 
-    if (_attachedFile != null && _attachedFile!.bytes != null) {
-      final encryptedBytes = IDMCEngine.processBytes(Uint8List.fromList(_attachedFile!.bytes!), seed);
-      final ciphertext = base64.encode(encryptedBytes);
-      ref.read(firebaseServiceProvider).sendSecureMessage(
-        widget.chatRoomId,
-        ciphertext,
-        messageType: 'file',
-        attachmentName: _attachedFile!.name,
+        await ref.read(firebaseServiceProvider).sendSecureMessage(
+          widget.chatRoomId,
+          '',
+          messageType: 'file',
+          attachmentName: _attachedFile!.name,
+          encryptionKey: key,
+          encryptedBytes: encryptedBytes,
+        );
+
+        if (mounted) {
+          setState(() => _attachedFile = null);
+        }
+      } else {
+        final plaintext = _textController.text.trim();
+        if (plaintext.isEmpty) return;
+
+        final key = _generateMessageKey();
+        final seed = IGMHSynchronizer.generate512BitSeed(key);
+        final ciphertext = IDMCEngine.encryptText(plaintext, seed);
+
+        await ref.read(firebaseServiceProvider).sendSecureMessage(
+          widget.chatRoomId,
+          ciphertext,
+          encryptionKey: key,
+        );
+        if (mounted) {
+          _textController.clear();
+        }
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to send message: $e')),
       );
-      setState(() => _attachedFile = null);
-    } else {
-      final ciphertext = IDMCEngine.encryptText(_textController.text.trim(), seed);
-      ref.read(firebaseServiceProvider).sendSecureMessage(widget.chatRoomId, ciphertext);
-      _textController.clear();
     }
   }
 
@@ -211,6 +246,8 @@ class _MessageBubbleState extends State<_MessageBubble> {
   String? _decryptedText;
   Uint8List? _decryptedBytes;
 
+  bool get _isBinaryMessage => widget.message.messageType != 'text';
+
   bool _isImageFile(String? name) {
     if (name == null) return false;
     final lower = name.toLowerCase();
@@ -218,13 +255,25 @@ class _MessageBubbleState extends State<_MessageBubble> {
   }
 
   void _decrypt() {
-    final seed = IGMHSynchronizer.generate512BitSeed("default-session");
-    if (widget.message.messageType == 'file') {
+    final encryptionKey = widget.message.encryptionKey;
+    if (encryptionKey == null || encryptionKey.isEmpty) {
+      setState(() {
+        _decryptedText = 'Missing encryption key for this message';
+        _isDecrypted = true;
+      });
+      return;
+    }
+
+    final seed = IGMHSynchronizer.generate512BitSeed(encryptionKey);
+    if (_isBinaryMessage) {
       try {
-        final encryptedBytes = base64.decode(widget.message.content);
-        _decryptedBytes = IDMCEngine.processBytes(Uint8List.fromList(encryptedBytes), seed, decrypt: true);
+        final encryptedBytes = widget.message.contentBytes ??
+            Uint8List.fromList(base64.decode(widget.message.content));
+        _decryptedBytes = IDMCEngine.processBytes(encryptedBytes, seed, decrypt: true);
+        _decryptedText = null;
       } catch (_) {
         _decryptedText = 'Unable to decrypt attachment';
+        _decryptedBytes = null;
       }
     } else {
       _decryptedText = IDMCEngine.decryptText(widget.message.content, seed);
@@ -233,6 +282,31 @@ class _MessageBubbleState extends State<_MessageBubble> {
     setState(() {
       _isDecrypted = true;
     });
+  }
+
+  Future<void> _saveReconstructedFile() async {
+    if (_decryptedBytes == null) return;
+
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final filename = (widget.message.attachmentName != null &&
+              widget.message.attachmentName!.trim().isNotEmpty)
+          ? widget.message.attachmentName!
+          : 'reconstructed_${DateTime.now().millisecondsSinceEpoch}.bin';
+      final outputPath = '${directory.path}${Platform.pathSeparator}$filename';
+
+      await File(outputPath).writeAsBytes(_decryptedBytes!, flush: true);
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Reconstructed file saved: $outputPath')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to save reconstructed file: $e')),
+      );
+    }
   }
 
   @override
@@ -265,14 +339,14 @@ class _MessageBubbleState extends State<_MessageBubble> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    widget.message.messageType == 'file'
+                    _isBinaryMessage
                         ? 'Encrypted attachment${widget.message.attachmentName != null ? ': ${widget.message.attachmentName}' : ''}\nTap to decrypt.'
                         : widget.message.content,
                     style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.grey),
                   ),
                 ],
               )
-            else if (widget.message.messageType == 'file')
+            else if (_isBinaryMessage)
               _decryptedBytes != null
                   ? _isImageFile(widget.message.attachmentName)
                       ? ClipRRect(
@@ -302,6 +376,18 @@ class _MessageBubbleState extends State<_MessageBubble> {
                             Text(
                               'File size: ${_decryptedBytes!.lengthInBytes} bytes',
                               style: const TextStyle(color: Colors.white70, fontSize: 12),
+                            ),
+                            const SizedBox(height: 8),
+                            TextButton.icon(
+                              onPressed: _saveReconstructedFile,
+                              icon: const Icon(Icons.download_rounded, size: 16),
+                              label: const Text('Save Reconstructed File'),
+                              style: TextButton.styleFrom(
+                                foregroundColor: CyberTheme.primaryNeon,
+                                padding: EdgeInsets.zero,
+                                minimumSize: const Size(0, 0),
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                              ),
                             ),
                           ],
                         )

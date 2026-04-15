@@ -35,17 +35,13 @@ class FirebaseService {
   }
 
   /// Chat Management
-  Stream<List<JAVSMessage>> chatStream(String otherUid) {
+  Stream<List<JAVSMessage>> chatStream(String chatRoomId) {
     final user = _auth.currentUser;
     if (user == null) return Stream.value([]);
-    
-    // Sort UIDs to create a consistent Chat ID between two participants
-    final uids = [user.uid, otherUid]..sort();
-    final chatId = uids.join("_");
 
     return _db
         .collection('chats')
-        .doc(chatId)
+        .doc(chatRoomId)
         .collection('messages')
         .orderBy('timestamp', descending: true)
         .snapshots()
@@ -54,18 +50,45 @@ class FirebaseService {
             .toList());
   }
 
-  Future<void> sendSecureMessage(String recipientUid, String ciphertext) async {
+  Future<void> sendSecureMessage(String chatRoomId, String ciphertext) async {
     final user = _auth.currentUser;
     if (user == null) return;
 
-    final uids = [user.uid, recipientUid]..sort();
-    final chatId = uids.join("_");
+    final chatDoc = await _db.collection('chats').doc(chatRoomId).get();
+    final chatData = chatDoc.data();
+    final isGroupChat = chatData?['isGroup'] == true;
+    final recipientUid = _getOtherParticipantUid(chatRoomId, user.uid);
+    final recipient = recipientUid.isNotEmpty ? await getUserByUid(recipientUid) : null;
 
-    await _db.collection('chats').doc(chatId).collection('messages').add({
+    if (!isGroupChat) {
+      await _db.collection('chats').doc(chatRoomId).set({
+        'participants': [user.uid, if (recipientUid.isNotEmpty) recipientUid],
+        'isGroup': false,
+        'createdBy': user.uid,
+        'updatedAt': FieldValue.serverTimestamp(),
+        'lastMessage': ciphertext,
+        'lastMessageAt': FieldValue.serverTimestamp(),
+        'lastSenderId': user.uid,
+        'name': recipient?.displayName ?? recipient?.email ?? recipientUid,
+      }, SetOptions(merge: true));
+    }
+
+    await _db.collection('chats').doc(chatRoomId).collection('messages').add({
       'senderId': user.uid,
+      'recipientId': isGroupChat ? '' : recipientUid,
+      'senderEmail': user.email ?? '',
+      'recipientEmail': isGroupChat ? '' : (recipient?.email ?? ''),
       'content': ciphertext,
       'timestamp': FieldValue.serverTimestamp(),
+      'status': 'sent',
+      'messageType': isGroupChat ? 'group' : 'text',
     });
+  }
+
+  String _getOtherParticipantUid(String chatRoomId, String currentUserUid) {
+    final participants = chatRoomId.split('_');
+    if (participants.length != 2) return '';
+    return participants.firstWhere((uid) => uid != currentUserUid, orElse: () => '');
   }
 
   /// Save Encrypted Payload to Vault
@@ -99,6 +122,17 @@ class FirebaseService {
     }
   }
 
+  Future<JAVSUser?> getUserByUid(String uid) async {
+    try {
+      final doc = await _db.collection('users').doc(uid).get();
+      if (!doc.exists) return null;
+      return JAVSUser.fromFirestore(doc);
+    } catch (e) {
+      print('Error looking up user by uid: $e');
+      return null;
+    }
+  }
+
   /// Send encrypted message to user by email
   Future<bool> sendEncryptedMessageToEmail(
     String email,
@@ -121,7 +155,17 @@ class FirebaseService {
       final uids = [user.uid, recipient.uid]..sort();
       final chatId = uids.join("_");
 
-      // Send the encrypted message with the encryption key
+      await _db.collection('chats').doc(chatId).set({
+        'participants': uids,
+        'isGroup': false,
+        'createdBy': user.uid,
+        'updatedAt': FieldValue.serverTimestamp(),
+        'lastMessage': ciphertext,
+        'lastMessageAt': FieldValue.serverTimestamp(),
+        'lastSenderId': user.uid,
+        'name': recipient.displayName,
+      }, SetOptions(merge: true));
+
       await _db.collection('chats').doc(chatId).collection('messages').add({
         'senderId': user.uid,
         'recipientId': recipient.uid,
@@ -149,11 +193,16 @@ class FirebaseService {
 
       final allParticipants = [user.uid, ...participantUids];
 
-      final groupRef = await _db.collection('groups').add({
+      final groupRef = _db.collection('chats').doc();
+      await groupRef.set({
         'name': groupName,
         'participants': allParticipants,
+        'isGroup': true,
         'createdBy': user.uid,
         'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+        'lastMessage': '',
+        'lastMessageAt': FieldValue.serverTimestamp(),
       });
 
       return groupRef.id;
@@ -168,28 +217,49 @@ class FirebaseService {
     final user = _auth.currentUser;
     if (user == null) return Stream.value([]);
 
-    return _db.collection('chats').snapshots().map((snapshot) {
-      final chats = <Map<String, dynamic>>[];
-      
-      for (var doc in snapshot.docs) {
-        final chatId = doc.id;
-        final participants = chatId.split('_');
-        
-        if (participants.contains(user.uid)) {
-          final otherUid = participants.firstWhere(
-            (p) => p != user.uid,
-            orElse: () => '',
-          );
-          
-          chats.add({
-            'chatId': chatId,
-            'otherUid': otherUid,
-            'lastMessage': doc['lastMessage'] ?? '',
-            'timestamp': doc['timestamp'],
-          });
+    return _db
+        .collection('chats')
+        .where('participants', arrayContains: user.uid)
+        .snapshots()
+        .asyncMap((snapshot) async {
+      final chats = await Future.wait(snapshot.docs.map((doc) async {
+        final data = doc.data();
+        final participants = List<String>.from(data['participants'] ?? const <String>[]);
+        final otherUid = participants.firstWhere(
+          (participant) => participant != user.uid,
+          orElse: () => '',
+        );
+        final isGroup = data['isGroup'] == true;
+        final rawTimestamp = data['lastMessageAt'] as Timestamp? ?? data['updatedAt'] as Timestamp? ?? data['createdAt'] as Timestamp?;
+        final timestamp = rawTimestamp?.toDate() ?? DateTime.fromMillisecondsSinceEpoch(0);
+
+        String displayName;
+        String email;
+        if (isGroup) {
+          displayName = data['name'] as String? ?? 'Group Chat';
+          email = '';
+        } else {
+          final otherUser = otherUid.isNotEmpty ? await getUserByUid(otherUid) : null;
+          final fallbackDisplay = otherUid.isNotEmpty ? 'User_${otherUid.substring(0, 4)}' : 'Unknown';
+          displayName = otherUser?.displayName.isNotEmpty == true
+              ? otherUser!.displayName
+              : fallbackDisplay;
+          email = otherUser?.email ?? (data['email'] as String? ?? '');
         }
-      }
-      
+
+        return {
+          'chatId': doc.id,
+          'otherUid': otherUid,
+          'displayName': displayName,
+          'email': email,
+          'lastMessage': data['lastMessage'] as String? ?? '',
+          'timestamp': timestamp,
+          'isGroup': isGroup,
+        };
+      }));
+
+      chats.sort((a, b) => (b['timestamp'] as DateTime).compareTo(a['timestamp'] as DateTime));
+
       return chats;
     });
   }
@@ -259,10 +329,17 @@ class JAVSUser {
 
   factory JAVSUser.fromFirestore(DocumentSnapshot doc) {
     final Map<String, dynamic> data = doc.data() as Map<String, dynamic>? ?? {};
+    final email = (data['email'] as String?) ?? '';
+    final fallbackName = email.contains('@')
+        ? email.split('@').first
+        : 'User_${doc.id.substring(0, 4)}';
+
     return JAVSUser(
       uid: doc.id,
-      email: data['email'] ?? '',
-      displayName: data['displayName'] ?? 'Agent_${doc.id.substring(0, 4)}',
+      email: email,
+      displayName: (data['displayName'] as String?)?.trim().isNotEmpty == true
+          ? (data['displayName'] as String).trim()
+          : fallbackName,
     );
   }
 }
@@ -339,4 +416,8 @@ final chatStreamProvider = StreamProvider.family<List<JAVSMessage>, String>((ref
 
 final deliveryHistoryStreamProvider = StreamProvider<List<DeliveryHistoryItem>>((ref) {
   return ref.watch(firebaseServiceProvider).deliveryHistoryStream();
+});
+
+final userChatsStreamProvider = StreamProvider<List<Map<String, dynamic>>>((ref) {
+  return ref.watch(firebaseServiceProvider).getUserChats();
 });

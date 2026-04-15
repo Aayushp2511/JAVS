@@ -1050,7 +1050,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
   }
 
   Widget _buildMessagesTab() {
-    final agentsAsync = ref.watch(contactStreamProvider);
+    final chatsAsync = ref.watch(userChatsStreamProvider);
     return Padding(
       padding: const EdgeInsets.all(24.0),
       child: Column(
@@ -1103,9 +1103,9 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
           const SizedBox(height: 12),
           // Chat list
           Expanded(
-            child: agentsAsync.when(
-              data: (agents) {
-                if (agents.isEmpty) {
+            child: chatsAsync.when(
+              data: (chats) {
+                if (chats.isEmpty) {
                   return const Center(
                     child: Text(
                       "No chats yet.\nAdd a user to start messaging.",
@@ -1115,15 +1115,21 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                   );
                 }
                 return ListView.builder(
-                  itemCount: agents.length,
+                  itemCount: chats.length,
                   itemBuilder: (context, index) {
-                    final agent = agents[index];
+                    final chat = chats[index];
+                    final displayName = chat['displayName'] as String? ?? 'Unknown';
+                    final otherEmail = chat['email'] as String? ?? '';
+                    final lastMessage = chat['lastMessage'] as String? ?? '';
+                    final timestamp = chat['timestamp'] as DateTime? ?? DateTime.fromMillisecondsSinceEpoch(0);
+                    final chatRoomId = chat['chatId'] as String? ?? '';
+
                     return ListTile(
                       leading: CircleAvatar(
                         backgroundColor: CyberTheme.primaryNeon.withOpacity(0.2),
                         child: Text(
-                          agent.displayName.isNotEmpty 
-                              ? agent.displayName.substring(0, 1).toUpperCase()
+                          displayName.isNotEmpty
+                              ? displayName.substring(0, 1).toUpperCase()
                               : 'U',
                           style: const TextStyle(
                             color: CyberTheme.primaryNeon,
@@ -1131,25 +1137,25 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                           ),
                         ),
                       ),
-                      title: Text(agent.displayName),
+                      title: Text(displayName),
                       subtitle: Text(
-                        agent.email,
+                        otherEmail.isNotEmpty ? otherEmail : lastMessage,
                         style: const TextStyle(fontSize: 10, color: Colors.grey),
                       ),
-                      trailing: const Icon(Icons.chevron_right, color: CyberTheme.primaryNeon),
+                      trailing: Text(
+                        _formatTimestamp(timestamp),
+                        style: const TextStyle(fontSize: 10, color: Colors.grey),
+                      ),
                       onTap: () {
-                        final currentUserId = FirebaseAuth.instance.currentUser?.uid;
-                        if (currentUserId == null) return;
-                        
-                        final uids = [currentUserId, agent.uid]..sort();
-                        final chatRoomId = uids.join('_');
-                        
+                        if (chatRoomId.isEmpty) return;
+
                         Navigator.push(
                           context,
                           MaterialPageRoute(
                             builder: (context) => ChatScreen(
                               chatRoomId: chatRoomId,
-                              chatName: agent.displayName,
+                              chatName: displayName,
+                              isGroup: chat['isGroup'] as bool? ?? false,
                             ),
                           ),
                         );
@@ -1168,7 +1174,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                       const Icon(Icons.error_outline, size: 48, color: Colors.red),
                       const SizedBox(height: 16),
                       Text(
-                        "Unable to load users",
+                        "Unable to load chats",
                         style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                       ),
                       const SizedBox(height: 8),

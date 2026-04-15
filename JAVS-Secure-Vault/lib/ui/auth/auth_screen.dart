@@ -47,6 +47,10 @@ class _AuthScreenState extends State<AuthScreen> {
 
   Future<void> _loadPreviousEmails() async {
     try {
+      if (FirebaseAuth.instance.currentUser == null) {
+        return;
+      }
+
       final snapshot = await FirebaseFirestore.instance
           .collection('users')
           .orderBy('createdAt', descending: true)
@@ -75,6 +79,41 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
+  Future<void> _ensureUserProfile(User user) async {
+    final userRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
+    final userDoc = await userRef.get();
+
+    final normalizedEmail = (user.email ?? _emailController.text.trim()).toLowerCase();
+    final fallbackName = normalizedEmail.contains('@')
+        ? normalizedEmail.split('@').first
+        : 'User_${user.uid.substring(0, 4)}';
+
+    if (!userDoc.exists) {
+      await userRef.set({
+        'displayName': user.displayName?.trim().isNotEmpty == true
+            ? user.displayName!.trim()
+            : fallbackName,
+        'email': normalizedEmail,
+        'status': 'Online',
+        'lastUpdate': FieldValue.serverTimestamp(),
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+      return;
+    }
+
+    final data = userDoc.data() ?? {};
+    await userRef.set({
+      'displayName': (data['displayName'] as String?)?.trim().isNotEmpty == true
+          ? (data['displayName'] as String).trim()
+          : fallbackName,
+      'email': (data['email'] as String?)?.trim().isNotEmpty == true
+          ? (data['email'] as String).toLowerCase()
+          : normalizedEmail,
+      'status': 'Online',
+      'lastUpdate': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
   Future<void> _submit() async {
     if (_emailController.text.isEmpty || _passwordController.text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -86,10 +125,13 @@ class _AuthScreenState extends State<AuthScreen> {
     setState(() => _isLoading = true);
     try {
       if (_isLogin) {
-        await FirebaseAuth.instance.signInWithEmailAndPassword(
+        final cred = await FirebaseAuth.instance.signInWithEmailAndPassword(
           email: _emailController.text.trim(),
           password: _passwordController.text.trim(),
         );
+        if (cred.user != null) {
+          await _ensureUserProfile(cred.user!);
+        }
         await _saveCredentials();
       } else {
         if (_nameController.text.isEmpty) {
@@ -110,6 +152,8 @@ class _AuthScreenState extends State<AuthScreen> {
           'lastUpdate': FieldValue.serverTimestamp(),
           'createdAt': FieldValue.serverTimestamp(),
         });
+
+        await _ensureUserProfile(cred.user!);
         
         await _saveCredentials();
       }
